@@ -109,13 +109,21 @@ func (s *Server) handleTriage(w http.ResponseWriter, r *http.Request) {
 			targetKey = llmOverride.APIKey
 		}
 		overrideClient, err := llamacpp.NewClientWithAuth(targetURL, targetKey, s.cfg.LLMTimeout, true)
-		if err == nil {
-			defer overrideClient.Close()
-			provider = overrideClient
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "llm override: "+err.Error())
+			return
 		}
+		defer overrideClient.Close()
+		provider = overrideClient
 	}
 	if llmOverride.Model != "" {
 		runCfg.Model = llmOverride.Model
+	}
+	if llmOverride.Temperature != nil {
+		runCfg.Temperature = *llmOverride.Temperature
+	}
+	if llmOverride.MaxTokens > 0 {
+		runCfg.MaxCompletionTokens = llmOverride.MaxTokens
 	}
 
 	ctx := builtin.WithScratchpadSession(r.Context(), runID)

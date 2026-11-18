@@ -62,8 +62,11 @@ const (
 	EventPlanReady    EventKind = "plan_ready"
 	EventTaskStart    EventKind = "task_start"
 	EventToolCall     EventKind = "tool_call"
+	EventToolResult   EventKind = "tool_result"
+	EventToken        EventKind = "token"
 	EventTaskDone     EventKind = "task_done"
 	EventSynthesizing EventKind = "synthesizing"
+	EventError        EventKind = "error"
 )
 
 // Event carries progress telemetry for UI/logging consumers.

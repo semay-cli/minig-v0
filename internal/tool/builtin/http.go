@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -36,8 +38,14 @@ func (t *observabilityHTTPTool) Parameters() json.RawMessage {
 			"headers": {"type": "object", "description": "Optional request headers as key-value pairs"},
 			"body": {"type": "string", "description": "Optional request body for POST/PUT"},
 			"auth_token": {"type": "string", "description": "Optional Bearer token for Authorization header"},
+			"basic_user": {"type": "string", "description": "Optional HTTP basic auth username"},
+			"basic_password": {"type": "string", "description": "Optional HTTP basic auth password"},
+			"query": {"type": "object", "description": "Optional query parameters merged into the URL"},
+			"backend": {"type": "string", "description": "Optional helper: loki or prometheus. Appends the query_range path when missing"},
+			"query_expr": {"type": "string", "description": "LogQL or PromQL expression used with backend"},
 			"timeout_seconds": {"type": "integer", "description": "Request timeout in seconds (default 10, max 30)"},
-			"json_path": {"type": "string", "description": "Dot-separated JSON path to extract from response (e.g. 'data.result')"}
+			"json_path": {"type": "string", "description": "Dot-separated JSON path to extract from response (e.g. 'data.result')"},
+			"extract_regex": {"type": "string", "description": "Optional regex; up to 20 matches replace the body"}
 		}
 	}`)
 }
@@ -53,8 +61,14 @@ func (t *observabilityHTTPTool) Execute(ctx context.Context, rawArgs json.RawMes
 		Headers        map[string]string `json:"headers"`
 		Body           string            `json:"body"`
 		AuthToken      string            `json:"auth_token"`
+		BasicUser      string            `json:"basic_user"`
+		BasicPassword  string            `json:"basic_password"`
+		Query          map[string]string `json:"query"`
+		Backend        string            `json:"backend"`
+		QueryExpr      string            `json:"query_expr"`
 		TimeoutSeconds int               `json:"timeout_seconds"`
 		JSONPath       string            `json:"json_path"`
+		ExtractRegex   string            `json:"extract_regex"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return "", fmt.Errorf("parse observability_http arguments: %w", err)
@@ -66,6 +80,11 @@ func (t *observabilityHTTPTool) Execute(ctx context.Context, rawArgs json.RawMes
 	}
 	if !strings.HasPrefix(trimmedURL, "http://") && !strings.HasPrefix(trimmedURL, "https://") {
 		return "", errors.New("url must begin with http:// or https://")
+	}
+
+	trimmedURL, err := applyObservabilityURL(trimmedURL, args.Backend, args.QueryExpr, args.Query)
+	if err != nil {
+		return "", err
 	}
 
 	method := strings.ToUpper(strings.TrimSpace(args.Method))
@@ -105,9 +124,11 @@ func (t *observabilityHTTPTool) Execute(ctx context.Context, rawArgs json.RawMes
 		req.Header.Set(k, v)
 	}
 
-	// Set Authorization if provided
-	if args.AuthToken != "" {
+	// Set Authorization if provided. Bearer wins over basic auth.
+	if strings.TrimSpace(args.AuthToken) != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(args.AuthToken))
+	} else if strings.TrimSpace(args.BasicUser) != "" {
+		req.SetBasicAuth(args.BasicUser, args.BasicPassword)
 	}
 
 	// Default User-Agent if unset
@@ -137,6 +158,15 @@ func (t *observabilityHTTPTool) Execute(ctx context.Context, rawArgs json.RawMes
 	}
 
 	bodyStr := string(respBytes)
+
+	if pattern := strings.TrimSpace(args.ExtractRegex); pattern != "" && len(pattern) <= 256 {
+		if re, err := regexp.Compile(pattern); err == nil {
+			found := re.FindAllString(bodyStr, 20)
+			if len(found) > 0 {
+				bodyStr = strings.Join(found, "\n")
+			}
+		}
+	}
 
 	// If json_path requested, extract sub-element
 	if strings.TrimSpace(args.JSONPath) != "" {
@@ -195,4 +225,35 @@ func extractJSONPath(data []byte, path string) (string, error) {
 		return fmt.Sprintf("%v", current), nil
 	}
 	return string(encoded), nil
+}
+
+func applyObservabilityURL(rawURL, backend, queryExpr string, query map[string]string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse url: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case "loki":
+		if !strings.Contains(parsed.Path, "/loki/api/") {
+			parsed.Path = strings.TrimRight(parsed.Path, "/") + "/loki/api/v1/query_range"
+		}
+	case "prometheus":
+		if !strings.Contains(parsed.Path, "/api/v1/") {
+			parsed.Path = strings.TrimRight(parsed.Path, "/") + "/api/v1/query_range"
+		}
+	case "":
+	default:
+		return "", fmt.Errorf("unsupported observability backend %q", backend)
+	}
+	q := parsed.Query()
+	if expr := strings.TrimSpace(queryExpr); expr != "" {
+		q.Set("query", expr)
+	}
+	for k, v := range query {
+		if strings.TrimSpace(k) != "" {
+			q.Set(k, v)
+		}
+	}
+	parsed.RawQuery = q.Encode()
+	return parsed.String(), nil
 }

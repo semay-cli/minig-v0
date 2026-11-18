@@ -67,6 +67,10 @@ func (t *workspaceTerminalTool) Execute(ctx context.Context, rawArgs json.RawMes
 		}
 	}
 
+	if del := EditorDelegateFrom(ctx); del != nil && del.SupportsTerminal() {
+		return del.CreateTerminal(ctx, cmdStr, t.ws.Root())
+	}
+
 	timeout := defaultTerminalTimeout
 	if args.TimeoutSeconds > 0 {
 		timeout = time.Duration(args.TimeoutSeconds) * time.Second

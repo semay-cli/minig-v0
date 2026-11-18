@@ -152,6 +152,65 @@ func (r *Registry) Execute(ctx context.Context, allowed []string, name string, r
 	return textutil.TruncateBytes(out, r.maxOutputBytes), nil
 }
 
+// MCPDescriptor is a Model Context Protocol tool definition.
+type MCPDescriptor struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema"`
+	Parameters  json.RawMessage `json:"parameters"`
+	Annotations map[string]any  `json:"annotations,omitempty"`
+}
+
+// Subset returns a registry containing only the named tools that exist.
+// Unknown names are ignored. An empty name list yields an empty registry.
+func (r *Registry) Subset(names []string) (*Registry, error) {
+	sub, err := NewRegistry(r.maxOutputBytes, r.timeout)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, rawName := range names {
+		name := strings.TrimSpace(rawName)
+		if t, ok := r.tools[name]; ok {
+			sub.tools[name] = t
+		}
+	}
+	return sub, nil
+}
+
+// MCPDescriptors returns every registered tool as an MCP tool definition.
+func (r *Registry) MCPDescriptors() []MCPDescriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]MCPDescriptor, 0, len(names))
+	for _, name := range names {
+		t := r.tools[name]
+		params := t.Parameters()
+		if len(params) == 0 || !json.Valid(params) {
+			params = json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		out = append(out, MCPDescriptor{
+			Name:        t.Name(),
+			Description: t.Description(),
+			InputSchema: params,
+			Parameters:  params,
+			Annotations: map[string]any{
+				"readOnlyHint":    t.ReadOnly(),
+				"destructiveHint": !t.ReadOnly(),
+			},
+		})
+	}
+	return out
+}
+
 func toSpec(t Tool) llm.ToolSpec {
 	params := t.Parameters()
 	if len(params) == 0 {

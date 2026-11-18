@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -265,6 +267,7 @@ func TestRegisterHeadless(t *testing.T) {
 	names := reg.Names()
 	expected := []string{
 		"alert_dispatch",
+		"doc_extract",
 		"log_template_miner",
 		"observability_http",
 		"sandbox_python",
@@ -283,5 +286,38 @@ func TestRegisterHeadless(t *testing.T) {
 		if !found {
 			t.Errorf("expected tool %q in headless registry, got: %v", exp, names)
 		}
+	}
+}
+
+func TestDocExtractInlineHTML(t *testing.T) {
+	tool := &docExtractTool{}
+	raw, _ := json.Marshal(map[string]any{
+		"content": "<html><script>bad()</script><body><h1>Runbook</h1><p>Restart the pool.</p></body></html>",
+	})
+	out, err := tool.Execute(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "bad()") || !strings.Contains(out, "Restart the pool") {
+		t.Fatalf("unexpected extract: %s", out)
+	}
+}
+
+func TestWorkspaceCodeSearchAndSymbols(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "auth.go"), []byte("package auth\n\nfunc ValidateToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := safety.NewWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := &workspaceCodeTool{ws: ws, allowWrite: false}
+	out, err := code.Execute(context.Background(), json.RawMessage(`{"action":"symbols","query":"ValidateToken"}`))
+	if err != nil || !strings.Contains(out, "ValidateToken") {
+		t.Fatalf("symbols = (%q, %v)", out, err)
+	}
+	if _, err := code.Execute(context.Background(), json.RawMessage(`{"action":"patch","path":"auth.go","old_text":"func","new_text":"func "}`)); err == nil {
+		t.Fatal("expected patch to be rejected when writes are disabled")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/semay-cli/minig-v0/internal/safety"
 	"github.com/semay-cli/minig-v0/internal/textutil"
 )
 
@@ -59,13 +60,18 @@ func (t *sandboxPythonTool) Execute(ctx context.Context, rawArgs json.RawMessage
 		return "", errors.New("script must not be empty")
 	}
 
-	// Create ephemeral sandbox directory
-	tmpDir, err := os.MkdirTemp("", "minig-py-*")
+	// Create ephemeral sandbox directory /tmp/minig-run-<id> and always remove it.
+	sb, err := safety.NewSandbox()
 	if err != nil {
 		return "", fmt.Errorf("create python sandbox: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer sb.Cleanup()
+	tmpDir := sb.Dir()
 
+	// Mount explicit context_data, or the per-run payload when the model omits it.
+	if strings.TrimSpace(args.ContextData) == "" {
+		args.ContextData = RunContextData(ctx)
+	}
 	// Write context.json if context_data is provided
 	if trimmedContext := strings.TrimSpace(args.ContextData); trimmedContext != "" {
 		contextPath := filepath.Join(tmpDir, "context.json")

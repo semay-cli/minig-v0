@@ -71,6 +71,30 @@ export PATH="$PWD/bin:$PATH"
 
 ---
 
+## Dual-Mode Runtime
+
+The same binary is a local coding agent and a headless SRE service. Neither mode shells out to an external MCP server; the tools live in-process.
+
+| Mode | Command | Workspace | Who calls it |
+|---|---|---|---|
+| Interactive coding | `minig "…"` or `minig acp` | `local` (project files, git, ripgrep) | Terminal, Zed, IntelliJ IDEA, VS Code |
+| Headless automation | `minig serve --host 0.0.0.0 --port 8080` | `none` (no cwd, no `.git`) | Python alerting and log pipelines |
+
+`minig acp` speaks Agent Client Protocol JSON-RPC on stdin/stdout. File reads, writes, and terminal commands are handed back to the IDE. Copy-paste configs for Zed (`~/.config/zed/settings.json`), JetBrains (`~/.jetbrains/acp.json`), and VS Code are in [`docs/ide-setup.md`](./docs/ide-setup.md) and [`configs/ide/`](./configs/ide/).
+
+`minig serve` defaults to `workspace_mode=none`. `POST /v1/agent/run` accepts `prompt`, `context_data`, `allowed_tools`, `response_schema`, and `llm_config`. Per-request llama.cpp routing uses `X-LLM-Base-URL`, `X-LLM-API-Key`, and `X-LLM-Model` (or `llm_config` in the body), then the IDE environment (`LLAMA_CPP_URL`, `LLAMA_CPP_API_KEY`, `LLAMA_CPP_MODEL`), then `~/.config/minig/config.json`. Set `MINIG_API_KEY` to require a bearer token on the HTTP API. Scratch work for `sandbox_python` goes to `/tmp/minig-run-<id>` and is removed before the response returns.
+
+```bash
+minig serve --host 0.0.0.0 --port 8080
+python3 examples/python_sre_client.py --base-url http://127.0.0.1:8080
+```
+
+`minig mcp` serves the built-in tool registry over MCP stdio. The previous `--serve`, `--mcp`, and goal-argument CLI flags still work.
+
+Built-in tools that do not need a project checkout: `observability_http`, `log_template_miner`, `sandbox_python`, `alert_dispatch`, `web_fetch`, `doc_extract`, `session_scratchpad`. Local sessions also get `workspace_code`, `workspace_terminal` (with `--write`), and the existing file tools.
+
+---
+
 ## CLI Coding Agent Usage
 
 ### Read-Only Exploration & Code Analysis
@@ -127,9 +151,12 @@ minig --serve --port 8080 --workspace /path/to/my/project
 | Method | Path | Content-Type | Description |
 |---|---|---|---|
 | `GET` | `/v1/health` | `application/json` | Health check for minig and llama.cpp |
-| `GET` | `/v1/tools` | `application/json` | List all available built-in and MCP tool schemas |
-| `POST` | `/v1/run` | `application/json` | Synchronously execute a goal; returns complete `RunResult` |
-| `POST` | `/v1/run/stream` | `text/event-stream` | Execute a goal with Server-Sent Events (SSE) streaming |
+| `GET` | `/v1/tools` | `application/json` | Built-in tools as MCP descriptors (`inputSchema`, annotations) |
+| `POST` | `/v1/agent/run` | `application/json` | One agent run. Returns `run_id`, `structured_output`, `tool_trace` |
+| `POST` | `/v1/agent/stream` | `text/event-stream` | SSE events: `plan`, `tool_start`, `tool_result`, `token`, `final`, `error` |
+| `POST` | `/v1/triage` | `application/json` | Log window in, incident diagnosis object out |
+| `POST` | `/v1/run` | `application/json` | Alias of `/v1/agent/run` |
+| `POST` | `/v1/run/stream` | `text/event-stream` | Alias of the stream endpoint with the original event names |
 
 ### 1. Synchronous API Example (`POST /v1/run`)
 
@@ -305,8 +332,13 @@ Quantized 7B/8B models make mistakes. `minig` turns tool failures into self-corr
 | `--model` | `local` | Model identifier string |
 | `--workspace` | `.` | Workspace root directory |
 | `--write` | `false` | Enable write tools (`write_file`, `edit_file`, etc.) |
-| `--serve` | `false` | Start HTTP REST & SSE API server |
+| `--serve` | `false` | Start HTTP REST & SSE API server (keeps the local workspace) |
+| `serve` | | Subcommand. Headless HTTP service, `workspace_mode=none` unless `--workspace` is set |
+| `acp` | | Subcommand. Agent Client Protocol on stdin/stdout |
+| `mcp` | | Subcommand. Expose built-in tools as an MCP stdio server |
+| `--host` | `0.0.0.0` | Bind address for `minig serve` |
 | `--port` | `8080` | HTTP API server port |
+| `--workspace-mode` | `local` | `local`, `none`, or `ephemeral` |
 | `--mcp` | none | Repeatable MCP spec as `name='command args...'` |
 | `--max-tasks` | `24` | Maximum micro-tasks per run (1–64) |
 | `--max-steps` | `16` | Maximum tool-call reasoning steps per micro-task |
@@ -320,7 +352,7 @@ Quantized 7B/8B models make mistakes. `minig` turns tool failures into self-corr
 ### Environment Variables
 
 All settings can be specified via environment variables:
-`MINIG_LLAMA_URL`, `MINIG_MODEL`, `MINIG_WORKSPACE`, `MINIG_MCP_SERVERS`, `MINIG_ALLOW_WRITE`, `MINIG_MAX_MICRO_TASKS`, `MINIG_MAX_STEPS_PER_TASK`, `MINIG_TASK_CONTEXT_TOKENS`, `MINIG_TOTAL_RUN_TOKENS`, `MINIG_MAX_TOOL_OUTPUT_BYTES`, `MINIG_LLM_TIMEOUT`, `MINIG_TOOL_TIMEOUT`, `MINIG_ALLOW_REMOTE_LLM`.
+`LLAMA_CPP_URL`, `LLAMA_CPP_API_KEY`, `LLAMA_CPP_MODEL`, `MINIG_LLAMA_URL`, `MINIG_MODEL`, `MINIG_WORKSPACE`, `MINIG_WORKSPACE_MODE`, `MINIG_API_KEY`, `MINIG_MCP_SERVERS`, `MINIG_ALLOW_WRITE`, `MINIG_MAX_MICRO_TASKS`, `MINIG_MAX_STEPS_PER_TASK`, `MINIG_TASK_CONTEXT_TOKENS`, `MINIG_TOTAL_RUN_TOKENS`, `MINIG_MAX_TOOL_OUTPUT_BYTES`, `MINIG_LLM_TIMEOUT`, `MINIG_TOOL_TIMEOUT`, `MINIG_ALLOW_REMOTE_LLM`.
 
 ---
 
@@ -340,6 +372,7 @@ Evaluated on an **NVIDIA RTX 4060 (8 GB VRAM)** with `Qwen2.5-Coder-7B-Instruct-
 
 ## Documentation
 
+- [`docs/ide-setup.md`](./docs/ide-setup.md): Zed, IntelliJ IDEA, VS Code, and Python service setup.
 - [`AGENT.md`](./AGENT.md): Full agent specification, prompt architectures, and safety contracts.
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md): Deep dive into stage implementation and instructions for adding custom capabilities (agentic workflows, built-in tools, MCP servers, and LLM backends).
 

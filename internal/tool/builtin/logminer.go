@@ -69,6 +69,23 @@ func (t *logTemplateMinerTool) Execute(ctx context.Context, rawArgs json.RawMess
 	if maxTemplates > 50 {
 		maxTemplates = 50
 	}
+	return CompressLogs(trimmedLogs, maxTemplates)
+}
+
+// CompressLogs normalizes raw log text into frequency-counted templates.
+// It is used by the log_template_miner tool and by the agent when a tool
+// result would overflow the local context window.
+func CompressLogs(logs string, maxTemplates int) (string, error) {
+	trimmedLogs := strings.TrimSpace(logs)
+	if trimmedLogs == "" {
+		return "", errors.New("logs must not be empty")
+	}
+	if maxTemplates <= 0 {
+		maxTemplates = 20
+	}
+	if maxTemplates > 50 {
+		maxTemplates = 50
+	}
 
 	rawLines := strings.Split(strings.ReplaceAll(trimmedLogs, "\r\n", "\n"), "\n")
 

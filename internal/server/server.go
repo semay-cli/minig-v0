@@ -14,6 +14,7 @@ import (
 	"github.com/semay-cli/minig-v0/internal/config"
 	"github.com/semay-cli/minig-v0/internal/llm"
 	"github.com/semay-cli/minig-v0/internal/llm/llamacpp"
+	"github.com/semay-cli/minig-v0/internal/safety"
 	"github.com/semay-cli/minig-v0/internal/tool"
 	"github.com/semay-cli/minig-v0/internal/tool/builtin"
 )
@@ -95,7 +96,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
-	specs := s.tools.Specs(nil)
+	specs := s.tools.MCPDescriptors()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -125,19 +126,21 @@ type RunResponse struct {
 	RunID            string                `json:"run_id"`
 	Status           string                `json:"status"`
 	Output           string                `json:"output"`
+	Answer           string                `json:"answer,omitempty"`
 	StructuredOutput json.RawMessage       `json:"structured_output,omitempty"`
 	ToolTrace        []agent.ToolTraceItem `json:"tool_trace,omitempty"`
 	Usage            map[string]int        `json:"usage"`
 	DurationMs       int64                 `json:"duration_ms"`
 }
 
-func (s *Server) prepareExecution(r *http.Request, req RunRequest) (config.Config, llm.Provider, *tool.Registry, string, agent.RunConfig, error) {
+func (s *Server) prepareExecution(r *http.Request, req RunRequest) (config.Config, llm.Provider, *tool.Registry, string, agent.RunConfig, func(), error) {
+	nop := func() {}
 	goal := strings.TrimSpace(req.Goal)
 	if goal == "" {
 		goal = strings.TrimSpace(req.Prompt)
 	}
 	if goal == "" {
-		return config.Config{}, nil, nil, "", agent.RunConfig{}, errors.New("goal or prompt is required")
+		return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, errors.New("goal or prompt is required")
 	}
 
 	runCfg := s.cfg
@@ -160,15 +163,77 @@ func (s *Server) prepareExecution(r *http.Request, req RunRequest) (config.Confi
 		runCfg.Temperature = *req.Temperature
 	}
 
-	// Validate config with workspace_mode consideration
-	if err := runCfg.Validate(); err != nil {
-		return config.Config{}, nil, nil, "", agent.RunConfig{}, err
+	llmOverride := extractLLMConfig(r, req.LLMConfig)
+	if llmOverride.Model != "" {
+		runCfg.Model = llmOverride.Model
+	}
+	if llmOverride.Temperature != nil {
+		runCfg.Temperature = *llmOverride.Temperature
+	}
+	if llmOverride.MaxTokens > 0 {
+		runCfg.MaxCompletionTokens = llmOverride.MaxTokens
 	}
 
-	// Dynamic LLM override (headers > body > server defaults)
-	llmOverride := extractLLMConfig(r, req.LLMConfig)
-	provider := s.provider
+	cleanup := nop
+	var reg *tool.Registry
+	switch strings.ToLower(strings.TrimSpace(runCfg.WorkspaceMode)) {
+	case "none":
+		hReg, err := tool.NewRegistry(s.cfg.MaxToolOutputBytes, s.cfg.ToolTimeout)
+		if err != nil {
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, cleanup, err
+		}
+		if err := builtin.RegisterHeadless(hReg); err != nil {
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, cleanup, err
+		}
+		reg = hReg
+	case "ephemeral":
+		sb, err := safety.NewSandbox()
+		if err != nil {
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, cleanup, err
+		}
+		cleanup = func() { _ = sb.Cleanup() }
+		runCfg.WorkspaceRoot = sb.Dir()
+		ws, err := safety.NewWorkspace(sb.Dir())
+		if err != nil {
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, err
+		}
+		eReg, err := tool.NewRegistry(s.cfg.MaxToolOutputBytes, s.cfg.ToolTimeout)
+		if err != nil {
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, err
+		}
+		if err := builtin.RegisterAll(eReg, ws, true); err != nil {
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, err
+		}
+		reg = eReg
+	default:
+		if s.cfg.WorkspaceMode == "none" {
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, cleanup, errors.New("this server has no local workspace; use workspace_mode none or ephemeral")
+		}
+		reg = s.tools
+	}
 
+	if len(req.AllowedTools) > 0 {
+		filtered, err := reg.Subset(req.AllowedTools)
+		if err != nil {
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, err
+		}
+		if len(filtered.Names()) == 0 {
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, errors.New("allowed_tools matched no registered tools")
+		}
+		reg = filtered
+	}
+
+	if err := runCfg.Validate(); err != nil {
+		cleanup()
+		return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, err
+	}
+
+	provider := s.provider
 	if llmOverride.BaseURL != "" || llmOverride.APIKey != "" {
 		targetURL := s.cfg.LlamaURL
 		if llmOverride.BaseURL != "" {
@@ -179,28 +244,16 @@ func (s *Server) prepareExecution(r *http.Request, req RunRequest) (config.Confi
 			targetKey = llmOverride.APIKey
 		}
 		overrideClient, err := llamacpp.NewClientWithAuth(targetURL, targetKey, s.cfg.LLMTimeout, true)
-		if err == nil {
-			provider = overrideClient
-		}
-	}
-	if llmOverride.Model != "" {
-		runCfg.Model = llmOverride.Model
-	}
-
-	// Tool registry scoping
-	var reg *tool.Registry
-	if runCfg.WorkspaceMode == "none" {
-		// Pure headless: register headless tools only
-		hReg, err := tool.NewRegistry(s.cfg.MaxToolOutputBytes, s.cfg.ToolTimeout)
 		if err != nil {
-			return config.Config{}, nil, nil, "", agent.RunConfig{}, err
+			cleanup()
+			return config.Config{}, nil, nil, "", agent.RunConfig{}, nop, fmt.Errorf("llm override: %w", err)
 		}
-		if err := builtin.RegisterHeadless(hReg); err != nil {
-			return config.Config{}, nil, nil, "", agent.RunConfig{}, err
+		provider = overrideClient
+		prev := cleanup
+		cleanup = func() {
+			overrideClient.Close()
+			prev()
 		}
-		reg = hReg
-	} else {
-		reg = s.tools
 	}
 
 	runID := generateRunID()
@@ -213,7 +266,7 @@ func (s *Server) prepareExecution(r *http.Request, req RunRequest) (config.Confi
 		MaxRetries:     runCfg.MaxRetries,
 	}
 
-	return runCfg, provider, reg, goal, rc, nil
+	return runCfg, provider, reg, goal, rc, cleanup, nil
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +278,8 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runCfg, provider, reg, goal, rc, err := s.prepareExecution(r, req)
+	runCfg, provider, reg, goal, rc, cleanup, err := s.prepareExecution(r, req)
+	defer cleanup()
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -250,6 +304,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		RunID:            rc.RunID,
 		Status:           "completed",
 		Output:           runRes.Answer,
+		Answer:           runRes.Answer,
 		StructuredOutput: runRes.StructuredOutput,
 		ToolTrace:        runRes.ToolTrace,
 		Usage: map[string]int{
@@ -279,11 +334,14 @@ func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runCfg, provider, reg, goal, rc, err := s.prepareExecution(r, req)
+	runCfg, provider, reg, goal, rc, cleanup, err := s.prepareExecution(r, req)
+	defer cleanup()
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	legacyStream := r.URL.Path == "/v1/run/stream"
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -301,7 +359,7 @@ func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	observer := agent.ObserverFunc(func(ev agent.Event) {
-		emitSSE(string(ev.Kind), ev)
+		emitSSE(streamEventName(ev.Kind, legacyStream), ev)
 	})
 
 	ctx := builtin.WithScratchpadSession(r.Context(), rc.RunID)
@@ -319,10 +377,15 @@ func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	emitSSE("done", RunResponse{
+	finalEvent := "final"
+	if legacyStream {
+		finalEvent = "done"
+	}
+	emitSSE(finalEvent, RunResponse{
 		RunID:            rc.RunID,
 		Status:           "completed",
 		Output:           res.Answer,
+		Answer:           res.Answer,
 		StructuredOutput: res.StructuredOutput,
 		ToolTrace:        res.ToolTrace,
 		Usage: map[string]int{
@@ -332,6 +395,26 @@ func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
 			"tool_calls":        res.Stats.ToolCalls,
 		},
 	})
+}
+
+func streamEventName(kind agent.EventKind, legacy bool) string {
+	if legacy {
+		return string(kind)
+	}
+	switch kind {
+	case agent.EventPlanReady:
+		return "plan"
+	case agent.EventToolCall:
+		return "tool_start"
+	case agent.EventToolResult:
+		return "tool_result"
+	case agent.EventToken:
+		return "token"
+	case agent.EventError:
+		return "error"
+	default:
+		return string(kind)
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {

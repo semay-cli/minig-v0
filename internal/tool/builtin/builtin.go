@@ -40,6 +40,7 @@ func RegisterHeadless(reg *tool.Registry) error {
 		&sandboxPythonTool{},
 		&alertDispatchTool{},
 		&webFetchTool{},
+		&docExtractTool{},
 		&sessionScratchpadTool{},
 	}
 	for _, t := range tools {
@@ -67,6 +68,7 @@ func RegisterAll(reg *tool.Registry, ws *safety.Workspace, allowWrite bool) erro
 
 	// Register workspace tools
 	tools := []tool.Tool{
+		&workspaceCodeTool{ws: ws, allowWrite: allowWrite},
 		&listDirTool{ws: ws},
 		&readRangeTool{ws: ws},
 		&searchTextTool{ws: ws},
@@ -220,6 +222,17 @@ func (t *readRangeTool) Execute(ctx context.Context, rawArgs json.RawMessage) (s
 	}
 	if args.MaxLines > maxReadLines {
 		args.MaxLines = maxReadLines
+	}
+
+	if del := EditorDelegateFrom(ctx); del != nil && del.SupportsRead() {
+		content, err := del.ReadTextFile(ctx, args.Path, args.StartLine, args.MaxLines)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(content) == "" {
+			return fmt.Sprintf("%s (empty file)", args.Path), nil
+		}
+		return fmt.Sprintf("%s (via IDE):\n%s", args.Path, content), nil
 	}
 
 	resolved, err := t.ws.ResolveExisting(args.Path)
@@ -419,6 +432,13 @@ func (t *writeFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (s
 		return "", errors.New("path is required")
 	}
 
+	if del := EditorDelegateFrom(ctx); del != nil && del.SupportsWrite() {
+		if _, err := del.WriteTextFile(ctx, args.Path, args.Content); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("wrote %d bytes to %s via IDE", len(args.Content), args.Path), nil
+	}
+
 	resolved, err := t.ws.Resolve(args.Path)
 	if err != nil {
 		return "", err
@@ -482,6 +502,10 @@ func (t *editFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (st
 	}
 	if args.OldText == args.NewText {
 		return "", errors.New("old_text and new_text are identical")
+	}
+
+	if del := EditorDelegateFrom(ctx); del != nil && del.SupportsRead() && del.SupportsWrite() {
+		return editViaEditor(ctx, del, args.Path, args.OldText, args.NewText)
 	}
 
 	resolved, err := t.ws.ResolveExisting(args.Path)

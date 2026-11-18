@@ -10,9 +10,11 @@ import (
 
 	"github.com/semay-cli/minig-v0/internal/budget"
 	"github.com/semay-cli/minig-v0/internal/config"
+	"github.com/semay-cli/minig-v0/internal/jsonschema"
 	"github.com/semay-cli/minig-v0/internal/llm"
 	"github.com/semay-cli/minig-v0/internal/textutil"
 	"github.com/semay-cli/minig-v0/internal/tool"
+	"github.com/semay-cli/minig-v0/internal/tool/builtin"
 )
 
 const (
@@ -154,13 +156,26 @@ func (e *Engine) Run(ctx context.Context, userGoal string) (RunResult, error) {
 func (e *Engine) RunWithConfig(ctx context.Context, userGoal string, rc RunConfig) (RunResult, error) {
 	start := time.Now()
 
-	// Append context_data to goal if provided
+	// Append context_data to goal if provided and mount it for sandbox_python.
 	effectiveGoal := userGoal
 	if len(rc.ContextData) > 0 {
 		effectiveGoal = fmt.Sprintf("%s\n\nContext Data:\n%s", userGoal, string(rc.ContextData))
+		ctx = builtin.WithRunContextData(ctx, rc.ContextData)
 	}
 
-	res, err := e.Run(ctx, effectiveGoal)
+	eng := e
+	if len(rc.AllowedTools) > 0 {
+		sub, err := e.tools.Subset(rc.AllowedTools)
+		if err != nil {
+			return RunResult{}, err
+		}
+		if len(sub.Names()) == 0 {
+			return RunResult{}, errors.New("allowed_tools matched no registered tools")
+		}
+		eng = &Engine{cfg: e.cfg, provider: e.provider, tools: sub, observer: e.observer}
+	}
+
+	res, err := eng.Run(ctx, effectiveGoal)
 	if err != nil {
 		res.Status = "error"
 		res.DurationMs = time.Since(start).Milliseconds()
@@ -195,14 +210,18 @@ func (e *Engine) enforceSchema(ctx context.Context, answer string, schema json.R
 		maxRetries = 1
 	}
 
-	// 1. First attempt: check if answer already contains a valid JSON object
-	if jsonBlob, ok := extractJSONObject(answer); ok {
-		if json.Valid([]byte(jsonBlob)) {
-			return json.RawMessage(jsonBlob), nil
+	// 1. First attempt: accept the answer only when it already matches the schema.
+	var lastErr error
+	if jsonBlob, ok := extractJSONObject(answer); ok && json.Valid([]byte(jsonBlob)) {
+		raw := json.RawMessage(jsonBlob)
+		if err := jsonschema.Validate(raw, schema); err == nil {
+			return raw, nil
+		} else {
+			lastErr = err
 		}
 	}
 
-	// 2. Retry loop: ask LLM to format according to schema
+	// 2. Retry loop: ask the model to format according to the schema. One retry is the floor.
 	schemaStr := string(schema)
 	if len(schemaStr) > 2048 {
 		schemaStr = schemaStr[:2048]
@@ -211,6 +230,11 @@ func (e *Engine) enforceSchema(ctx context.Context, answer string, schema json.R
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+
+		userContent := textutil.TruncateBytes(answer, 4096)
+		if lastErr != nil {
+			userContent += "\n\nPrevious JSON failed schema validation: " + lastErr.Error()
 		}
 
 		messages := []llm.Message{
@@ -222,27 +246,36 @@ func (e *Engine) enforceSchema(ctx context.Context, answer string, schema json.R
 			},
 			{
 				Role:    llm.RoleUser,
-				Content: textutil.TruncateBytes(answer, 4096),
+				Content: userContent,
 			},
 		}
 
 		resp, err := e.provider.Chat(ctx, llm.ChatRequest{
 			Model:       e.cfg.Model,
 			Messages:    messages,
-			MaxTokens:   1024,
+			MaxTokens:   e.clampCompletionTokens(256, 1024),
 			Temperature: 0.0,
 		})
 		if err != nil {
+			lastErr = err
 			continue
 		}
 
-		if jsonBlob, ok := extractJSONObject(resp.Content); ok {
-			if json.Valid([]byte(jsonBlob)) {
-				return json.RawMessage(jsonBlob), nil
+		if jsonBlob, ok := extractJSONObject(resp.Content); ok && json.Valid([]byte(jsonBlob)) {
+			raw := json.RawMessage(jsonBlob)
+			if err := jsonschema.Validate(raw, schema); err == nil {
+				return raw, nil
+			} else {
+				lastErr = err
 			}
+		} else {
+			lastErr = errors.New("response did not contain a JSON object")
 		}
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to produce structured output matching schema: %w", lastErr)
+	}
 	return nil, errors.New("failed to produce structured output matching schema")
 }
 
@@ -288,6 +321,7 @@ func (e *Engine) executeMicroTask(
 
 	toolCallsCount := 0
 	var trace []ToolTraceItem
+	failCount := map[string]int{}
 
 	for {
 		if _, err := tb.NextStep(); err != nil {
@@ -320,6 +354,13 @@ func (e *Engine) executeMicroTask(
 		}
 		if err := tb.RecordTokens(resp.PromptTokens, resp.CompletionTokens); err != nil {
 			return TaskResult{}, err
+		}
+		if strings.TrimSpace(resp.Content) != "" {
+			e.emit(Event{
+				Kind:    EventToken,
+				TaskID:  task.ID,
+				Message: textutil.TruncateBytes(resp.Content, 400),
+			})
 		}
 
 		// No tool calls means this micro-task reached its terminal answer.
@@ -361,12 +402,38 @@ func (e *Engine) executeMicroTask(
 			})
 
 			toolOut, execErr := e.tools.Execute(ctx, task.Tools, tc.Name, tc.Arguments)
+			rawOut := toolOut
+			if execErr == nil {
+				if herr := httpStatusFailure(tc.Name, rawOut); herr != nil {
+					execErr = herr
+				}
+			}
 			var errStr string
 			if execErr != nil {
 				errStr = execErr.Error()
-				toolOut = formatToolErrorDiagnostic(tc.Name, execErr)
+				failCount[tc.Name]++
+				diag := formatToolErrorDiagnostic(tc.Name, execErr)
+				limit := e.cfg.MaxRetries
+				if limit > 0 && failCount[tc.Name] > limit {
+					diag = fmt.Sprintf("TOOL RETRIES EXHAUSTED (%d/%d). %s Do not call %s again with the same arguments; summarize the failure.", failCount[tc.Name], limit, diag, tc.Name)
+				} else if limit > 0 {
+					diag = fmt.Sprintf("%s\nRETRY %d of %d: adjust parameters or code and try again.", diag, failCount[tc.Name], limit)
+				}
+				if strings.TrimSpace(rawOut) != "" {
+					toolOut = diag + "\nOutput:\n" + rawOut
+				} else {
+					toolOut = diag
+				}
+			} else if compressed, ok := compressOversized(tc.Name, toolOut); ok {
+				toolOut = compressed
 			}
 			toolOut = textutil.TruncateBytes(textutil.CompactWhitespace(toolOut), perToolCap)
+
+			e.emit(Event{
+				Kind:    EventToolResult,
+				TaskID:  task.ID,
+				Message: fmt.Sprintf("%s => %s", tc.Name, textutil.TruncateBytes(toolOut, 180)),
+			})
 
 			trace = append(trace, ToolTraceItem{
 				TaskID: task.ID,
@@ -453,11 +520,47 @@ func (e *Engine) synthesize(ctx context.Context, ledger *budget.Ledger, userGoal
 }
 
 func (e *Engine) clampCompletionTokens(promptTokens, desiredMax int) int {
+	if e.cfg.MaxCompletionTokens > 0 && e.cfg.MaxCompletionTokens < desiredMax {
+		desiredMax = e.cfg.MaxCompletionTokens
+	}
 	remainingInWindow := e.cfg.TaskContextTokens - promptTokens
 	if remainingInWindow < desiredMax {
 		return remainingInWindow
 	}
 	return desiredMax
+}
+
+func httpStatusFailure(toolName, output string) error {
+	switch toolName {
+	case "observability_http", "web_fetch", "doc_extract", "alert_dispatch":
+	default:
+		return nil
+	}
+	line := output
+	if i := strings.IndexByte(output, '\n'); i >= 0 {
+		line = output[:i]
+	}
+	var code int
+	if _, err := fmt.Sscanf(strings.TrimSpace(line), "HTTP %d", &code); err == nil && code >= 400 {
+		return fmt.Errorf("HTTP %d response from %s", code, toolName)
+	}
+	return nil
+}
+
+func compressOversized(toolName, output string) (string, bool) {
+	if strings.TrimSpace(output) == "" {
+		return "", false
+	}
+	lines := strings.Count(output, "\n") + 1
+	looksLikeLogs := toolName == "observability_http" || strings.Contains(output, "ERROR") || strings.Contains(output, "Exception")
+	if lines < 40 || !looksLikeLogs || len(output) < 1500 {
+		return "", false
+	}
+	compressed, err := builtin.CompressLogs(output, 12)
+	if err != nil || len(compressed) >= len(output) {
+		return "", false
+	}
+	return "COMPRESSED LOG SUMMARY:\n" + compressed, true
 }
 
 func (e *Engine) emit(ev Event) {

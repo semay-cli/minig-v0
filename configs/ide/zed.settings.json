@@ -1,0 +1,14 @@
+{
+  "agent_servers": {
+    "minig": {
+      "type": "custom",
+      "command": "minig",
+      "args": ["acp"],
+      "env": {
+        "LLAMA_CPP_URL": "http://127.0.0.1:8080",
+        "LLAMA_CPP_API_KEY": "",
+        "LLAMA_CPP_MODEL": "local"
+      }
+    }
+  }
+}

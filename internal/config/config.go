@@ -15,26 +15,27 @@ import (
 
 // Config holds bounded runtime settings for a micro-task agent run.
 type Config struct {
-	LlamaURL           string        `json:"llama_url"`
-	LlamaAPIKey        string        `json:"llama_api_key"`
-	Model              string        `json:"model"`
-	WorkspaceRoot      string        `json:"workspace_root"`
-	WorkspaceMode      string        `json:"workspace_mode"` // "none" | "ephemeral" | "local"
-	ServerHost         string        `json:"server_host"`
-	ServerPort         int           `json:"server_port"`
-	APIKey             string        `json:"api_key"`
-	MCPServers         []string      `json:"mcp_servers"`
-	MaxMicroTasks      int           `json:"max_micro_tasks"`
-	MaxStepsPerTask    int           `json:"max_steps_per_task"`
-	TaskContextTokens  int           `json:"task_context_tokens"`
-	TotalRunTokens     int           `json:"total_run_tokens"`
-	MaxToolOutputBytes int           `json:"max_tool_output_bytes"`
-	LLMTimeout         time.Duration `json:"llm_timeout"`
-	ToolTimeout        time.Duration `json:"tool_timeout"`
-	Temperature        float64       `json:"temperature"`
-	AllowWrite         bool          `json:"allow_write"`
-	AllowRemoteLLM     bool          `json:"allow_remote_llm"`
-	MaxRetries         int           `json:"max_retries"`
+	LlamaURL            string        `json:"llama_url"`
+	LlamaAPIKey         string        `json:"llama_api_key"`
+	Model               string        `json:"model"`
+	WorkspaceRoot       string        `json:"workspace_root"`
+	WorkspaceMode       string        `json:"workspace_mode"` // "none" | "ephemeral" | "local"
+	ServerHost          string        `json:"server_host"`
+	ServerPort          int           `json:"server_port"`
+	APIKey              string        `json:"api_key"`
+	MCPServers          []string      `json:"mcp_servers"`
+	MaxMicroTasks       int           `json:"max_micro_tasks"`
+	MaxStepsPerTask     int           `json:"max_steps_per_task"`
+	TaskContextTokens   int           `json:"task_context_tokens"`
+	TotalRunTokens      int           `json:"total_run_tokens"`
+	MaxToolOutputBytes  int           `json:"max_tool_output_bytes"`
+	LLMTimeout          time.Duration `json:"llm_timeout"`
+	ToolTimeout         time.Duration `json:"tool_timeout"`
+	Temperature         float64       `json:"temperature"`
+	MaxCompletionTokens int           `json:"max_completion_tokens"`
+	AllowWrite          bool          `json:"allow_write"`
+	AllowRemoteLLM      bool          `json:"allow_remote_llm"`
+	MaxRetries          int           `json:"max_retries"`
 }
 
 // Default returns conservative, resource-efficient defaults tuned for local GGUF models.
@@ -217,6 +218,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Temperature < 0 || c.Temperature > 2 {
 		return fmt.Errorf("temperature must be between 0 and 2, got %v", c.Temperature)
+	}
+	if c.MaxCompletionTokens != 0 && (c.MaxCompletionTokens < 16 || c.MaxCompletionTokens > 4096) {
+		return fmt.Errorf("max completion tokens must be 0 or between 16 and 4096, got %d", c.MaxCompletionTokens)
 	}
 	if c.MaxRetries < 0 || c.MaxRetries > 5 {
 		return fmt.Errorf("max retries must be between 0 and 5, got %d", c.MaxRetries)
