@@ -123,4 +123,68 @@ func TestEditFileSurgicalReplacement(t *testing.T) {
 	if !strings.Contains(string(got), "return a + b") {
 		t.Errorf("file not updated as expected:\n%s", string(got))
 	}
+
+	// Mismatched whitespace produces diagnostic guidance
+	_, err = reg.Execute(context.Background(), nil, "edit_file", json.RawMessage(`{
+		"path": "calc.go",
+		"old_text": "    return a + b",
+		"new_text": "    return a * b"
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "DIAGNOSTIC") {
+		t.Fatalf("expected diagnostic mismatch error, got: %v", err)
+	}
+}
+
+func TestFileInfoAppendDeleteTools(t *testing.T) {
+	root := t.TempDir()
+	ws, err := safety.NewWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := tool.NewRegistry(4096, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterAll(reg, ws, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// append_file creates file if absent
+	appOut, err := reg.Execute(context.Background(), nil, "append_file", json.RawMessage(`{
+		"path": "notes.txt",
+		"content": "line 1\n"
+	}`))
+	if err != nil || !strings.Contains(appOut, "appended 7 bytes") {
+		t.Fatalf("append_file = (%q, %v)", appOut, err)
+	}
+
+	// append_file appends to existing file
+	_, err = reg.Execute(context.Background(), nil, "append_file", json.RawMessage(`{
+		"path": "notes.txt",
+		"content": "line 2\n"
+	}`))
+	if err != nil {
+		t.Fatalf("second append_file failed: %v", err)
+	}
+
+	// file_info inspects file
+	infoOut, err := reg.Execute(context.Background(), nil, "file_info", json.RawMessage(`{
+		"path": "notes.txt"
+	}`))
+	if err != nil || !strings.Contains(infoOut, "lines: 2") || !strings.Contains(infoOut, "type: text") {
+		t.Fatalf("file_info = (%q, %v)", infoOut, err)
+	}
+
+	// delete_file deletes the file
+	delOut, err := reg.Execute(context.Background(), nil, "delete_file", json.RawMessage(`{
+		"path": "notes.txt"
+	}`))
+	if err != nil || !strings.Contains(delOut, "deleted file notes.txt") {
+		t.Fatalf("delete_file = (%q, %v)", delOut, err)
+	}
+
+	// Verify file is gone
+	if _, err := os.Stat(filepath.Join(root, "notes.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected notes.txt to be deleted, stat err: %v", err)
+	}
 }

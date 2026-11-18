@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/semay-cli/minig-v0/internal/safety"
 	"github.com/semay-cli/minig-v0/internal/textutil"
@@ -41,11 +42,14 @@ func RegisterAll(reg *tool.Registry, ws *safety.Workspace, allowWrite bool) erro
 		&listDirTool{ws: ws},
 		&readRangeTool{ws: ws},
 		&searchTextTool{ws: ws},
+		&fileInfoTool{ws: ws},
 	}
 	if allowWrite {
 		tools = append(tools,
 			&writeFileTool{ws: ws},
 			&editFileTool{ws: ws},
+			&appendFileTool{ws: ws},
+			&deleteFileTool{ws: ws},
 		)
 	}
 	for _, t := range tools {
@@ -477,7 +481,8 @@ func (t *editFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (st
 	content := string(raw)
 	matches := strings.Count(content, args.OldText)
 	if matches == 0 {
-		return "", fmt.Errorf("old_text not found in %q; inspect exact lines with read_range first", args.Path)
+		diag := findEditMismatchDiagnostic(content, args.OldText)
+		return "", fmt.Errorf("old_text not found in %q; %s", args.Path, diag)
 	}
 	if matches > 1 {
 		return "", fmt.Errorf("old_text matched %d locations in %q; include more surrounding context lines", matches, args.Path)
@@ -491,4 +496,218 @@ func (t *editFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (st
 	oldLines := strings.Count(args.OldText, "\n") + 1
 	newLines := strings.Count(args.NewText, "\n") + 1
 	return fmt.Sprintf("edited %s (replaced %d line(s) with %d line(s))", args.Path, oldLines, newLines), nil
+}
+
+func findEditMismatchDiagnostic(content, oldText string) string {
+	oldLines := strings.Split(strings.ReplaceAll(oldText, "\r\n", "\n"), "\n")
+	var targetSnippet string
+	for _, l := range oldLines {
+		trimmed := strings.TrimSpace(l)
+		if len(trimmed) > 4 {
+			targetSnippet = trimmed
+			break
+		}
+	}
+	if targetSnippet == "" {
+		return "inspect exact lines with read_range first"
+	}
+
+	contentLines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	for idx, line := range contentLines {
+		if strings.Contains(strings.TrimSpace(line), targetSnippet) {
+			return fmt.Sprintf("DIAGNOSTIC: similar content found near line %d (whitespace/indentation mismatch suspected). Inspect with read_range around line %d before editing.", idx+1, idx+1)
+		}
+	}
+	return "inspect exact lines with read_range first"
+}
+
+// --- file_info ---
+
+type fileInfoTool struct {
+	ws *safety.Workspace
+}
+
+func (t *fileInfoTool) Name() string   { return "file_info" }
+func (t *fileInfoTool) ReadOnly() bool { return true }
+func (t *fileInfoTool) Description() string {
+	return "Inspect file metadata including size in bytes, line count, permissions, and modification time."
+}
+func (t *fileInfoTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"required": ["path"],
+		"properties": {
+			"path": {"type": "string", "description": "Workspace-relative file or directory path"}
+		}
+	}`)
+}
+
+func (t *fileInfoTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return "", fmt.Errorf("parse file_info arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return "", errors.New("path is required")
+	}
+
+	resolved, err := t.ws.ResolveExisting(args.Path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat %q: %w", args.Path, err)
+	}
+
+	if info.IsDir() {
+		return fmt.Sprintf("path: %s\ntype: directory\npermissions: %s\nmodified: %s",
+			args.Path, info.Mode().Perm(), info.ModTime().UTC().Format(time.RFC3339)), nil
+	}
+
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", fmt.Errorf("read %q: %w", args.Path, err)
+	}
+
+	isBinary := bytes.IndexByte(raw, 0) != -1
+	fileType := "text"
+	lineCount := 0
+	if isBinary {
+		fileType = "binary"
+	} else {
+		lineCount = strings.Count(string(raw), "\n")
+		if len(raw) > 0 && !strings.HasSuffix(string(raw), "\n") {
+			lineCount++
+		}
+	}
+
+	return fmt.Sprintf("path: %s\ntype: %s\nsize: %d bytes\nlines: %d\npermissions: %s\nmodified: %s",
+		args.Path, fileType, info.Size(), lineCount, info.Mode().Perm(), info.ModTime().UTC().Format(time.RFC3339)), nil
+}
+
+// --- append_file ---
+
+type appendFileTool struct {
+	ws *safety.Workspace
+}
+
+func (t *appendFileTool) Name() string   { return "append_file" }
+func (t *appendFileTool) ReadOnly() bool { return false }
+func (t *appendFileTool) Description() string {
+	return "Append UTF-8 text content to the end of a file inside the workspace, creating parent directories if needed."
+}
+func (t *appendFileTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"required": ["path", "content"],
+		"properties": {
+			"path": {"type": "string", "description": "Workspace-relative target file path"},
+			"content": {"type": "string", "description": "Text content to append"}
+		}
+	}`)
+}
+
+func (t *appendFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	var args struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return "", fmt.Errorf("parse append_file arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return "", errors.New("path is required")
+	}
+
+	resolved, err := t.ws.Resolve(args.Path)
+	if err != nil {
+		return "", err
+	}
+	if resolved == t.ws.Root() {
+		return "", errors.New("cannot append to workspace root directory")
+	}
+	if info, err := os.Stat(resolved); err == nil && info.IsDir() {
+		return "", fmt.Errorf("cannot append to directory %q", args.Path)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+		return "", fmt.Errorf("create parent directories: %w", err)
+	}
+
+	f, err := os.OpenFile(resolved, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("open %q: %w", args.Path, err)
+	}
+	defer f.Close()
+
+	n, err := f.WriteString(args.Content)
+	if err != nil {
+		return "", fmt.Errorf("append %q: %w", args.Path, err)
+	}
+	return fmt.Sprintf("appended %d bytes to %s", n, args.Path), nil
+}
+
+// --- delete_file ---
+
+type deleteFileTool struct {
+	ws *safety.Workspace
+}
+
+func (t *deleteFileTool) Name() string   { return "delete_file" }
+func (t *deleteFileTool) ReadOnly() bool { return false }
+func (t *deleteFileTool) Description() string {
+	return "Safely delete a regular file inside the workspace."
+}
+func (t *deleteFileTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"required": ["path"],
+		"properties": {
+			"path": {"type": "string", "description": "Workspace-relative file path to delete"}
+		}
+	}`)
+}
+
+func (t *deleteFileTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return "", fmt.Errorf("parse delete_file arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return "", errors.New("path is required")
+	}
+
+	resolved, err := t.ws.ResolveExisting(args.Path)
+	if err != nil {
+		return "", err
+	}
+	if resolved == t.ws.Root() {
+		return "", errors.New("cannot delete workspace root directory")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat %q: %w", args.Path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("cannot delete directory %q with delete_file", args.Path)
+	}
+
+	if err := os.Remove(resolved); err != nil {
+		return "", fmt.Errorf("delete %q: %w", args.Path, err)
+	}
+	return fmt.Sprintf("deleted file %s", args.Path), nil
 }

@@ -5,6 +5,7 @@ CMD    := ./cmd/minig
 
 build:
 	go build -trimpath -ldflags="-s -w" -o bin/$(BINARY) $(CMD)
+	go build -trimpath -ldflags="-s -w" -o /home/bushu/go/bin/$(BINARY) $(CMD)
 
 test:
 	go test ./...

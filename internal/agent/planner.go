@@ -28,9 +28,11 @@ func (e *Engine) decompose(ctx context.Context, ledger *budget.Ledger, userGoal 
 	}
 
 	sysPrompt := fmt.Sprintf(
-		"You are a micro-task planner. Decompose the user goal into atomic micro-tasks (up to %d).\n"+
+		"You are a micro-task planner for local coding agents running on 8GB GPU RAM.\n"+
+			"Decompose the user goal into atomic, ordered micro-tasks (up to %d).\n"+
 			"Rules:\n"+
-			"- If the goal has multiple phases (e.g., explore/find AND read/analyze/modify), create separate micro-tasks for each phase.\n"+
+			"- If the goal has multiple phases (explore/find, modify/write, verify/test, error-fixing), create separate micro-tasks for each phase.\n"+
+			"- For bug-fixing, refactoring, or database queries, plan an inspection task first, an edit/action task second, and a verification task last.\n"+
 			"- Use a single micro-task ONLY for trivial direct questions.\n"+
 			"- Assign only the minimum tools from [%s] needed for each micro-task.\n"+
 			"- Use depends_on to chain prerequisite task IDs.\n"+

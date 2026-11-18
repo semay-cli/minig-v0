@@ -6,15 +6,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/semay-cli/minig-v0/internal/agent"
 	"github.com/semay-cli/minig-v0/internal/config"
 	"github.com/semay-cli/minig-v0/internal/llm/llamacpp"
 	"github.com/semay-cli/minig-v0/internal/safety"
+	"github.com/semay-cli/minig-v0/internal/server"
 	"github.com/semay-cli/minig-v0/internal/tool"
 	"github.com/semay-cli/minig-v0/internal/tool/builtin"
 	"github.com/semay-cli/minig-v0/internal/tool/mcp"
@@ -51,9 +55,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 
 	var (
-		healthOnly bool
-		quiet      bool
-		jsonOut    bool
+		healthOnly  bool
+		versionFlag bool
+		serveMode   bool
+		port        int = 8080
+		quiet       bool
+		jsonOut     bool
 	)
 
 	fs.StringVar(&cfg.LlamaURL, "url", cfg.LlamaURL, "llama.cpp server base URL")
@@ -66,13 +73,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.BoolVar(&cfg.AllowWrite, "write", cfg.AllowWrite, "enable workspace file writes (write_file tool)")
 	fs.BoolVar(&cfg.AllowRemoteLLM, "allow-remote", cfg.AllowRemoteLLM, "allow non-loopback llama.cpp server URLs")
 	fs.BoolVar(&healthOnly, "health", false, "check llama.cpp server health and exit")
+	fs.BoolVar(&versionFlag, "version", false, "print minig version and exit")
+	fs.BoolVar(&serveMode, "serve", false, "run as an HTTP REST and SSE API server")
+	fs.IntVar(&port, "port", 8080, "HTTP API server port (default 8080)")
 	fs.BoolVar(&quiet, "quiet", false, "suppress micro-task progress output on stderr")
 	fs.BoolVar(&jsonOut, "json", false, "emit structured JSON output on stdout")
 	mcpSpecs := multiFlag(append([]string(nil), cfg.MCPServers...))
 	fs.Var(&mcpSpecs, "mcp", "stdio MCP server spec as name='command args...' (repeatable)")
 
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: minig [flags] <goal>\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage: minig [flags] <goal>\n       minig --serve [--port 8080] [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 
@@ -81,6 +91,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return nil
 		}
 		return err
+	}
+
+	if versionFlag {
+		fmt.Fprintf(stdout, "minig v0.1.0\n")
+		return nil
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -99,11 +114,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "healthy (%s)\n", cfg.LlamaURL)
 		return nil
-	}
-
-	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if goal == "" {
-		return errors.New("goal is required (example: minig \"summarize the Go files in this repo\")")
 	}
 
 	ws, err := safety.NewWorkspace(cfg.WorkspaceRoot)
@@ -139,6 +149,45 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	if serveMode {
+		srv, err := server.NewServer(cfg, client, reg)
+		if err != nil {
+			return err
+		}
+
+		addr := fmt.Sprintf(":%d", port)
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", addr, err)
+		}
+
+		httpServer := &http.Server{
+			Handler: srv.Handler(),
+		}
+		fmt.Fprintf(stderr, "minig API server listening on http://127.0.0.1:%d (workspace: %s, model: %s)\n", port, cfg.WorkspaceRoot, cfg.Model)
+
+		serverErr := make(chan error, 1)
+		go func() {
+			if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			return httpServer.Shutdown(shutdownCtx)
+		case err := <-serverErr:
+			return err
+		}
+	}
+
+	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if goal == "" {
+		return errors.New("goal is required (example: minig \"summarize the Go files in this repo\")")
 	}
 
 	renderer := ui.NewRenderer(stdout, stderr, quiet, jsonOut)

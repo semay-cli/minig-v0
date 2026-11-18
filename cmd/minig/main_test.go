@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/semay-cli/minig-v0/internal/agent"
 )
@@ -90,5 +91,51 @@ func TestCLIHealthAndEndToEndMicroRun(t *testing.T) {
 	}
 	if result.Stats.ToolCalls != 1 || result.Stats.TasksCompleted != 1 {
 		t.Errorf("unexpected stats: %+v", result.Stats)
+	}
+}
+
+func TestCLIServeMode(t *testing.T) {
+	workspace := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout, stderr bytes.Buffer
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- run(ctx, []string{
+			"--url", server.URL,
+			"--workspace", workspace,
+			"--serve",
+			"--port", "19080",
+		}, &stdout, &stderr)
+	}()
+
+	// Wait briefly for server to bind
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify health endpoint responds
+	res, err := http.Get("http://127.0.0.1:19080/v1/health")
+	if err != nil {
+		t.Fatalf("GET /v1/health failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	// Trigger graceful cancellation
+	cancel()
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("expected clean shutdown, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not shut down in time")
 	}
 }

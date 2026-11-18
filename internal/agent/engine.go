@@ -176,6 +176,7 @@ func (e *Engine) executeMicroTask(
 		{
 			Role: llm.RoleSystem,
 			Content: "Execute ONLY the Current Micro-Task. Call allowed tools only when needed to inspect or modify files. " +
+				"If a tool call fails, inspect the error diagnostic and self-correct immediately. " +
 				"Once complete, respond with a concise, factual summary of what you found or changed.",
 		},
 		{
@@ -258,7 +259,7 @@ func (e *Engine) executeMicroTask(
 
 			toolOut, execErr := e.tools.Execute(ctx, task.Tools, tc.Name, tc.Arguments)
 			if execErr != nil {
-				toolOut = "error: " + execErr.Error()
+				toolOut = formatToolErrorDiagnostic(tc.Name, execErr)
 			}
 			toolOut = textutil.TruncateBytes(textutil.CompactWhitespace(toolOut), perToolCap)
 
@@ -270,6 +271,20 @@ func (e *Engine) executeMicroTask(
 			})
 		}
 	}
+}
+
+func formatToolErrorDiagnostic(toolName string, err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "old_text not found") || strings.Contains(msg, "DIAGNOSTIC") {
+		return fmt.Sprintf("TOOL EXECUTION FAILED: %s\nRECOVERY GUIDANCE: Inspect the exact lines with read_range to verify whitespace and indentation, then retry edit_file with precise context.", msg)
+	}
+	if strings.Contains(msg, "does not exist") || strings.Contains(msg, "no such file") || strings.Contains(msg, "access path") {
+		return fmt.Sprintf("TOOL EXECUTION FAILED: %s\nRECOVERY GUIDANCE: File or path was not found. Use list_dir or search_text to locate the correct file path before retrying.", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "syntax") || strings.Contains(strings.ToLower(msg), "relation") || strings.Contains(strings.ToLower(msg), "column") {
+		return fmt.Sprintf("TOOL EXECUTION FAILED: %s\nRECOVERY GUIDANCE: Database or syntax error. Inspect schema using describe_table or list_tables before executing SQL.", msg)
+	}
+	return "error: " + msg
 }
 
 func (e *Engine) synthesize(ctx context.Context, ledger *budget.Ledger, userGoal string, results []TaskResult) (string, error) {
