@@ -1,0 +1,37 @@
+### 1. Check Server & LLM Health
+GET http://localhost:8080/v1/health
+Accept: application/json
+
+### 2. Discover Available Tools (Built-in + Connected MCP Servers)
+GET http://localhost:8080/v1/tools
+Accept: application/json
+
+### 3. Run Micro-Task Agent (Synchronous JSON Execution)
+POST http://localhost:8080/v1/run
+Content-Type: application/json
+
+{
+  "goal": "Inspect the project structure and summarize the core modules in internal/",
+  "max_tasks": 6,
+  "total_tokens": 25000
+}
+
+### 4. Run Micro-Task Agent with Code Modifications (Enable --write on server start)
+POST http://localhost:8080/v1/run
+Content-Type: application/json
+
+{
+  "goal": "Check internal/server/server.go and verify all endpoints handle context timeouts properly",
+  "max_tasks": 4,
+  "task_context_tokens": 4096
+}
+
+### 5. Run Micro-Task Agent with Real-Time SSE Streaming
+POST http://localhost:8080/v1/run/stream
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "goal": "Find all unit tests in internal/agent and verify test coverage",
+  "max_tasks": 4
+}

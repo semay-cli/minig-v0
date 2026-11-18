@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/semay-cli/minig-v0/internal/budget"
 	"github.com/semay-cli/minig-v0/internal/config"
@@ -118,6 +120,7 @@ func (e *Engine) Run(ctx context.Context, userGoal string) (RunResult, error) {
 	// Fast path: single micro-task output is already the final answer.
 	if len(results) == 1 {
 		return RunResult{
+			Status:  "completed",
 			Answer:  results[0].Output,
 			Tasks:   results,
 			Stats:   ledger.Stats(),
@@ -138,11 +141,109 @@ func (e *Engine) Run(ctx context.Context, userGoal string) (RunResult, error) {
 	}
 
 	return RunResult{
+		Status:  "completed",
 		Answer:  answer,
 		Tasks:   results,
 		Stats:   ledger.Stats(),
 		Planned: len(tasks),
 	}, nil
+}
+
+// RunWithConfig executes the full pipeline with per-run overrides, structured schema validation,
+// and accumulated tool traces.
+func (e *Engine) RunWithConfig(ctx context.Context, userGoal string, rc RunConfig) (RunResult, error) {
+	start := time.Now()
+
+	// Append context_data to goal if provided
+	effectiveGoal := userGoal
+	if len(rc.ContextData) > 0 {
+		effectiveGoal = fmt.Sprintf("%s\n\nContext Data:\n%s", userGoal, string(rc.ContextData))
+	}
+
+	res, err := e.Run(ctx, effectiveGoal)
+	if err != nil {
+		res.Status = "error"
+		res.DurationMs = time.Since(start).Milliseconds()
+		res.RunID = rc.RunID
+		return res, err
+	}
+
+	res.RunID = rc.RunID
+	res.DurationMs = time.Since(start).Milliseconds()
+
+	// Aggregate tool traces from tasks
+	var allTrace []ToolTraceItem
+	for _, taskRes := range res.Tasks {
+		allTrace = append(allTrace, taskRes.ToolTrace...)
+	}
+	res.ToolTrace = allTrace
+
+	// Enforce response schema if specified
+	if len(rc.ResponseSchema) > 0 && res.Answer != "" {
+		structured, err := e.enforceSchema(ctx, res.Answer, rc.ResponseSchema, rc.MaxRetries)
+		if err == nil {
+			res.StructuredOutput = structured
+		}
+	}
+
+	return res, nil
+}
+
+// enforceSchema extracts or instructs the LLM to format the response into the requested JSON schema.
+func (e *Engine) enforceSchema(ctx context.Context, answer string, schema json.RawMessage, maxRetries int) (json.RawMessage, error) {
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+
+	// 1. First attempt: check if answer already contains a valid JSON object
+	if jsonBlob, ok := extractJSONObject(answer); ok {
+		if json.Valid([]byte(jsonBlob)) {
+			return json.RawMessage(jsonBlob), nil
+		}
+	}
+
+	// 2. Retry loop: ask LLM to format according to schema
+	schemaStr := string(schema)
+	if len(schemaStr) > 2048 {
+		schemaStr = schemaStr[:2048]
+	}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		messages := []llm.Message{
+			{
+				Role: llm.RoleSystem,
+				Content: "Convert the following incident analysis or output into a strictly formatted JSON object matching the provided JSON Schema. " +
+					"Respond with ONLY valid JSON without markdown fences, reasoning, or commentary.\n" +
+					"Schema:\n" + schemaStr,
+			},
+			{
+				Role:    llm.RoleUser,
+				Content: textutil.TruncateBytes(answer, 4096),
+			},
+		}
+
+		resp, err := e.provider.Chat(ctx, llm.ChatRequest{
+			Model:       e.cfg.Model,
+			Messages:    messages,
+			MaxTokens:   1024,
+			Temperature: 0.0,
+		})
+		if err != nil {
+			continue
+		}
+
+		if jsonBlob, ok := extractJSONObject(resp.Content); ok {
+			if json.Valid([]byte(jsonBlob)) {
+				return json.RawMessage(jsonBlob), nil
+			}
+		}
+	}
+
+	return nil, errors.New("failed to produce structured output matching schema")
 }
 
 func (e *Engine) executeMicroTask(
@@ -186,6 +287,7 @@ func (e *Engine) executeMicroTask(
 	}
 
 	toolCallsCount := 0
+	var trace []ToolTraceItem
 
 	for {
 		if _, err := tb.NextStep(); err != nil {
@@ -232,6 +334,7 @@ func (e *Engine) executeMicroTask(
 				Output:     output,
 				TokensUsed: tb.TokensUsed(),
 				ToolCalls:  toolCallsCount,
+				ToolTrace:  trace,
 			}, nil
 		}
 
@@ -258,10 +361,20 @@ func (e *Engine) executeMicroTask(
 			})
 
 			toolOut, execErr := e.tools.Execute(ctx, task.Tools, tc.Name, tc.Arguments)
+			var errStr string
 			if execErr != nil {
+				errStr = execErr.Error()
 				toolOut = formatToolErrorDiagnostic(tc.Name, execErr)
 			}
 			toolOut = textutil.TruncateBytes(textutil.CompactWhitespace(toolOut), perToolCap)
+
+			trace = append(trace, ToolTraceItem{
+				TaskID: task.ID,
+				Tool:   tc.Name,
+				Args:   textutil.TruncateBytes(string(tc.Arguments), 512),
+				Output: textutil.TruncateBytes(toolOut, 512),
+				Error:  errStr,
+			})
 
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,

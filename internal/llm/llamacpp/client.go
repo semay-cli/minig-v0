@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,12 +31,19 @@ const (
 
 // Client communicates with a llama.cpp OpenAI-compatible HTTP server.
 type Client struct {
-	baseURL string
-	http    *http.Client
+	baseURL     string
+	apiKey      string
+	allowRemote bool
+	http        *http.Client
 }
 
-// NewClient constructs a bounded HTTP client for llama-server.
+// NewClient constructs a bounded HTTP client for llama-server without authentication.
 func NewClient(rawURL string, timeout time.Duration, allowRemote bool) (*Client, error) {
+	return NewClientWithAuth(rawURL, "", timeout, allowRemote)
+}
+
+// NewClientWithAuth constructs a bounded HTTP client for llama-server with an optional API key/token.
+func NewClientWithAuth(rawURL, apiKey string, timeout time.Duration, allowRemote bool) (*Client, error) {
 	if timeout <= 0 {
 		return nil, errors.New("request timeout must be greater than zero")
 	}
@@ -44,16 +52,18 @@ func NewClient(rawURL string, timeout time.Duration, allowRemote bool) (*Client,
 		return nil, err
 	}
 	return &Client{
-		baseURL: baseURL,
+		baseURL:     baseURL,
+		apiKey:      strings.TrimSpace(apiKey),
+		allowRemote: allowRemote,
 		http: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
 				Proxy:                  nil,
 				DisableCompression:     true,
 				DialContext:            (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-				MaxConnsPerHost:        2,
-				MaxIdleConns:           4,
-				MaxIdleConnsPerHost:    2,
+				MaxConnsPerHost:        4,
+				MaxIdleConns:           8,
+				MaxIdleConnsPerHost:    4,
 				IdleConnTimeout:        30 * time.Second,
 				TLSHandshakeTimeout:    2 * time.Second,
 				ResponseHeaderTimeout:  timeout,
@@ -74,23 +84,45 @@ func (c *Client) Close() {
 	}
 }
 
-// CheckHealth verifies that llama-server is reachable and ready.
+// CheckHealth verifies that llama-server is reachable and ready via /health or /props.
 func (c *Client) CheckHealth(ctx context.Context) error {
+	// Try /health first
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return fmt.Errorf("create health request: %w", err)
 	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("llama.cpp health check failed: %w", err)
+	if err == nil {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		// If 404, fallback to /props
+		if resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("llama.cpp health endpoint returned %s", resp.Status)
+		}
 	}
-	defer resp.Body.Close()
 
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024)); err != nil {
-		return fmt.Errorf("read health response: %w", err)
+	// Fallback to /props (llama-server slot introspection)
+	propsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/props", nil)
+	if err != nil {
+		return fmt.Errorf("create props request: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("llama.cpp health endpoint returned %s", resp.Status)
+	if c.apiKey != "" {
+		propsReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	propsResp, err := c.http.Do(propsReq)
+	if err != nil {
+		return fmt.Errorf("llama.cpp health/props check failed: %w", err)
+	}
+	defer propsResp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(propsResp.Body, 4*1024))
+	if propsResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("llama.cpp props endpoint returned %s", propsResp.Status)
 	}
 	return nil
 }
@@ -130,6 +162,9 @@ func (c *Client) CountTokens(ctx context.Context, model string, messages []llm.M
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -195,33 +230,48 @@ func (c *Client) Chat(ctx context.Context, input llm.ChatRequest) (llm.ChatRespo
 		toolChoice = "auto"
 	}
 
-	body, err := json.Marshal(struct {
-		Model       string        `json:"model"`
-		Messages    []wireMessage `json:"messages"`
-		Tools       []wireTool    `json:"tools,omitempty"`
-		ToolChoice  string        `json:"tool_choice,omitempty"`
-		MaxTokens   int           `json:"max_tokens"`
-		Temperature float64       `json:"temperature"`
-		Stream      bool          `json:"stream"`
-	}{
-		Model:       input.Model,
-		Messages:    wireMsgs,
-		Tools:       wireTools,
-		ToolChoice:  toolChoice,
-		MaxTokens:   maxTokens,
-		Temperature: input.Temperature,
-		Stream:      false,
-	})
+	requestPayload := map[string]any{
+		"model":       input.Model,
+		"messages":    wireMsgs,
+		"tools":       wireTools,
+		"max_tokens":  maxTokens,
+		"temperature": input.Temperature,
+		"stream":      false,
+	}
+	if toolChoice != "" {
+		requestPayload["tool_choice"] = toolChoice
+	}
+	if len(input.ResponseFormat) > 0 {
+		requestPayload["response_format"] = input.ResponseFormat
+	}
+
+	body, err := json.Marshal(requestPayload)
 	if err != nil {
 		return llm.ChatResponse{}, fmt.Errorf("encode chat request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	targetURL := c.baseURL
+	if strings.TrimSpace(input.BaseURL) != "" {
+		normalized, err := normalizeBaseURL(input.BaseURL, true)
+		if err == nil {
+			targetURL = normalized
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return llm.ChatResponse{}, fmt.Errorf("create chat request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+
+	targetKey := c.apiKey
+	if strings.TrimSpace(input.APIKey) != "" {
+		targetKey = strings.TrimSpace(input.APIKey)
+	}
+	if targetKey != "" {
+		req.Header.Set("Authorization", "Bearer "+targetKey)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -296,6 +346,15 @@ func (c *Client) Chat(ctx context.Context, input llm.ChatRequest) (llm.ChatRespo
 		})
 	}
 
+	// Fallback tool-calling parser if the model emitted tool calls in textual content instead of native tool_calls
+	if len(toolCalls) == 0 && len(wireTools) > 0 {
+		fallbackContent, fallbackCalls := parseFallbackToolCalls(cleanContent)
+		if len(fallbackCalls) > 0 {
+			cleanContent = fallbackContent
+			toolCalls = fallbackCalls
+		}
+	}
+
 	promptTokens := decoded.Usage.PromptTokens
 	if promptTokens == 0 {
 		promptTokens = estimatePromptTokens(input.Messages, input.Tools)
@@ -313,6 +372,107 @@ func (c *Client) Chat(ctx context.Context, input llm.ChatRequest) (llm.ChatRespo
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 	}, nil
+}
+
+// XML / JSON fallback patterns for non-native llama.cpp tool calling
+var (
+	toolCallXMLRegex   = regexp.MustCompile(`(?s)<tool_call>\s*(.*?)\s*</tool_call>`)
+	jsonCodeBlockRegex = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\}|\\[.*?\\])\\s*```")
+)
+
+// parseFallbackToolCalls extracts structured tool calls from conversational content
+func parseFallbackToolCalls(content string) (string, []llm.ToolCall) {
+	var calls []llm.ToolCall
+
+	// 1. Try <tool_call> ... </tool_call> XML tags
+	if matches := toolCallXMLRegex.FindAllStringSubmatchIndex(content, -1); len(matches) > 0 {
+		cleaned := content
+		offset := 0
+		for idx, m := range matches {
+			fullStart, fullEnd := m[0]-offset, m[1]-offset
+			groupStart, groupEnd := m[2]-offset, m[3]-offset
+			rawJSON := cleaned[groupStart:groupEnd]
+
+			var callItem struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(rawJSON), &callItem); err == nil && callItem.Name != "" {
+				args := callItem.Arguments
+				if len(args) == 0 {
+					args = json.RawMessage("{}")
+				}
+				calls = append(calls, llm.ToolCall{
+					ID:        fmt.Sprintf("fallback_call_%d", idx+1),
+					Name:      callItem.Name,
+					Arguments: args,
+				})
+				// Strip the <tool_call> block from cleaned text
+				cleaned = cleaned[:fullStart] + cleaned[fullEnd:]
+				offset += (fullEnd - fullStart)
+			}
+		}
+		if len(calls) > 0 {
+			return strings.TrimSpace(cleaned), calls
+		}
+	}
+
+	// 2. Try markdown fenced code blocks with {"name": ..., "arguments": ...} or {"tool_calls": [...]}
+	if matches := jsonCodeBlockRegex.FindAllStringSubmatchIndex(content, -1); len(matches) > 0 {
+		cleaned := content
+		offset := 0
+		for idx, m := range matches {
+			fullStart, fullEnd := m[0]-offset, m[1]-offset
+			groupStart, groupEnd := m[2]-offset, m[3]-offset
+			rawJSON := cleaned[groupStart:groupEnd]
+
+			// Check for single tool call {"name": "...", "arguments": ...}
+			var single struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(rawJSON), &single); err == nil && single.Name != "" {
+				args := single.Arguments
+				if len(args) == 0 {
+					args = json.RawMessage("{}")
+				}
+				calls = append(calls, llm.ToolCall{
+					ID:        fmt.Sprintf("fallback_call_%d", idx+1),
+					Name:      single.Name,
+					Arguments: args,
+				})
+				cleaned = cleaned[:fullStart] + cleaned[fullEnd:]
+				offset += (fullEnd - fullStart)
+				continue
+			}
+
+			// Check for array of calls [{"name": "..."}]
+			var list []struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(rawJSON), &list); err == nil && len(list) > 0 && list[0].Name != "" {
+				for j, item := range list {
+					args := item.Arguments
+					if len(args) == 0 {
+						args = json.RawMessage("{}")
+					}
+					calls = append(calls, llm.ToolCall{
+						ID:        fmt.Sprintf("fallback_call_%d_%d", idx+1, j+1),
+						Name:      item.Name,
+						Arguments: args,
+					})
+				}
+				cleaned = cleaned[:fullStart] + cleaned[fullEnd:]
+				offset += (fullEnd - fullStart)
+			}
+		}
+		if len(calls) > 0 {
+			return strings.TrimSpace(cleaned), calls
+		}
+	}
+
+	return content, nil
 }
 
 type wireTool struct {

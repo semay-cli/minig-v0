@@ -166,3 +166,63 @@ func TestOrderDAGRejectsCycles(t *testing.T) {
 		t.Fatalf("expected cycle error, got %v", err)
 	}
 }
+
+func TestEngineRunWithConfigAndSchemaEnforcement(t *testing.T) {
+	cfg, reg := setupTestEnv(t)
+
+	mock := &llm.MockProvider{
+		Responses: []llm.ChatResponse{
+			// 1. Planner fallback: single task
+			{
+				Content: "{\"tasks\":[{\"id\":\"t1\",\"goal\":\"Triage anomaly\",\"tools\":[\"observability_http\"]}]}",
+			},
+			// 2. Task t1 step 1: call observability_http
+			{
+				ToolCalls: []llm.ToolCall{{
+					ID:        "c1",
+					Name:      "observability_http",
+					Arguments: json.RawMessage(`{"url":"http://127.0.0.1:9090"}`),
+				}},
+			},
+			// 3. Task t1 step 2: diagnosis output with JSON object inside
+			{
+				Content: "Root cause identified: database saturation.\n{\"severity\":\"critical\",\"root_cause\":\"connection pool exhausted\",\"should_alert\":true}",
+			},
+		},
+	}
+
+	eng, err := NewEngine(cfg, mock, reg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	schema := json.RawMessage(`{"type":"object","properties":{"severity":{"type":"string"},"root_cause":{"type":"string"}}}`)
+	res, err := eng.RunWithConfig(context.Background(), "Triage incident", RunConfig{
+		RunID:          "run-test-456",
+		ResponseSchema: schema,
+		MaxRetries:     1,
+	})
+	if err != nil {
+		t.Fatalf("RunWithConfig failed: %v", err)
+	}
+
+	if res.RunID != "run-test-456" {
+		t.Errorf("expected RunID 'run-test-456', got %q", res.RunID)
+	}
+	if len(res.StructuredOutput) == 0 {
+		t.Error("expected non-empty StructuredOutput")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(res.StructuredOutput, &parsed); err != nil {
+		t.Fatalf("StructuredOutput is not valid JSON: %v", err)
+	}
+	if parsed["severity"] != "critical" || parsed["root_cause"] != "connection pool exhausted" {
+		t.Errorf("unexpected structured fields: %v", parsed)
+	}
+	if len(res.ToolTrace) != 1 {
+		t.Errorf("expected 1 ToolTraceItem, got %d", len(res.ToolTrace))
+	}
+	if res.ToolTrace[0].Tool != "observability_http" {
+		t.Errorf("expected ToolTrace[0].Tool to be 'observability_http', got %q", res.ToolTrace[0].Tool)
+	}
+}

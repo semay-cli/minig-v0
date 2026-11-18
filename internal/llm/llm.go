@@ -39,11 +39,14 @@ type Message struct {
 
 // ChatRequest configures a single bounded completion request.
 type ChatRequest struct {
-	Model       string
-	Messages    []Message
-	Tools       []ToolSpec
-	MaxTokens   int
-	Temperature float64
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Tools          []ToolSpec      `json:"tools,omitempty"`
+	MaxTokens      int             `json:"max_tokens,omitempty"`
+	Temperature    float64         `json:"temperature,omitempty"`
+	BaseURL        string          `json:"base_url,omitempty"`
+	APIKey         string          `json:"api_key,omitempty"`
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
 }
 
 // ChatResponse holds the cleaned assistant output, optional reasoning, and token usage.

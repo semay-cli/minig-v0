@@ -28,8 +28,30 @@ const (
 	maxSearchHits       = 50
 )
 
-// RegisterAll registers built-in workspace tools into reg.
-// write_file is only registered when allowWrite is true.
+// RegisterHeadless registers built-in tools suitable for headless operation (workspace_mode="none").
+// These tools have zero dependency on a local workspace or git repository.
+func RegisterHeadless(reg *tool.Registry) error {
+	if reg == nil {
+		return errors.New("tool registry must not be nil")
+	}
+	tools := []tool.Tool{
+		&observabilityHTTPTool{},
+		&logTemplateMinerTool{},
+		&sandboxPythonTool{},
+		&alertDispatchTool{},
+		&webFetchTool{},
+		&sessionScratchpadTool{},
+	}
+	for _, t := range tools {
+		if err := reg.Register(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RegisterAll registers all built-in tools: headless telemetry/compute tools plus
+// workspace-bound file inspection and mutation tools.
 func RegisterAll(reg *tool.Registry, ws *safety.Workspace, allowWrite bool) error {
 	if reg == nil {
 		return errors.New("tool registry must not be nil")
@@ -38,6 +60,12 @@ func RegisterAll(reg *tool.Registry, ws *safety.Workspace, allowWrite bool) erro
 		return errors.New("workspace must not be nil")
 	}
 
+	// Always register headless tools
+	if err := RegisterHeadless(reg); err != nil {
+		return err
+	}
+
+	// Register workspace tools
 	tools := []tool.Tool{
 		&listDirTool{ws: ws},
 		&readRangeTool{ws: ws},
@@ -50,6 +78,7 @@ func RegisterAll(reg *tool.Registry, ws *safety.Workspace, allowWrite bool) erro
 			&editFileTool{ws: ws},
 			&appendFileTool{ws: ws},
 			&deleteFileTool{ws: ws},
+			&workspaceTerminalTool{ws: ws},
 		)
 	}
 	for _, t := range tools {

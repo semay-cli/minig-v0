@@ -80,6 +80,115 @@ func TestChatStripsThinkAndParsesToolCalls(t *testing.T) {
 	}
 }
 
+func TestChatWithAuthAndPerRequestOverrides(t *testing.T) {
+	var receivedAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices": [{
+				"message": {"content": "ok from server"},
+				"finish_reason": "stop"
+			}],
+			"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+		}`))
+	}))
+	defer server.Close()
+
+	// Initialized with client auth
+	client, err := NewClientWithAuth("http://127.0.0.1:8080", "default-key", 5*time.Second, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Dynamic per-request override pointing to mock server with custom key
+	resp, err := client.Chat(context.Background(), llm.ChatRequest{
+		Model:    "test-model",
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "ping"}},
+		BaseURL:  server.URL,
+		APIKey:   "custom-req-key",
+	})
+	if err != nil {
+		t.Fatalf("Chat override failed: %v", err)
+	}
+	if receivedAuth != "Bearer custom-req-key" {
+		t.Errorf("got auth %q, want 'Bearer custom-req-key'", receivedAuth)
+	}
+	if resp.Content != "ok from server" {
+		t.Errorf("got content %q, want 'ok from server'", resp.Content)
+	}
+}
+
+func TestFallbackToolParserXMLAndJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Server returns no native tool_calls, but content contains <tool_call> XML
+		_, _ = w.Write([]byte(`{
+			"choices": [{
+				"message": {
+					"content": "I will query Loki.\n<tool_call>\n{\"name\": \"observability_http\", \"arguments\": {\"url\": \"http://loki:3100\"}}\n</tool_call>\nDone.",
+					"tool_calls": []
+				},
+				"finish_reason": "stop"
+			}],
+			"usage": {"prompt_tokens": 50, "completion_tokens": 30}
+		}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, 5*time.Second, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	resp, err := client.Chat(context.Background(), llm.ChatRequest{
+		Model:    "test-model",
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "fetch logs"}},
+		Tools: []llm.ToolSpec{{
+			Name:        "observability_http",
+			Description: "query endpoint",
+			Parameters:  json.RawMessage(`{"type":"object"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("expected 1 fallback tool call, got %d", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Name != "observability_http" {
+		t.Errorf("expected tool name 'observability_http', got %q", resp.ToolCalls[0].Name)
+	}
+}
+
+func TestCheckHealthPropsFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/props" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"default_generation_settings": {}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, 5*time.Second, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.CheckHealth(context.Background()); err != nil {
+		t.Fatalf("expected CheckHealth to succeed via /props fallback, got: %v", err)
+	}
+}
+
 func TestCountTokensEndpointAndFallback(t *testing.T) {
 	// 1. Endpoint supported
 	srvOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
