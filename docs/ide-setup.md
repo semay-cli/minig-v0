@@ -1,5 +1,7 @@
 # IDE and Python service setup
 
+The full walkthrough of every mode (terminal, IDE, HTTP, triage, MCP) is [`agent-guide.md`](./agent-guide.md). This page is only the config you paste into an editor or a service.
+
 `minig` is one binary with two modes.
 
 - `minig acp` speaks the Agent Client Protocol on stdin/stdout. Zed, IntelliJ IDEA, and VS Code start it and pass `LLAMA_CPP_URL`, `LLAMA_CPP_API_KEY`, and `LLAMA_CPP_MODEL` in the process environment. File reads, writes, and terminal commands are delegated back to the IDE (`fs/read_text_file`, `fs/write_text_file`, `terminal/create`) so diffs and permission prompts stay in the editor.

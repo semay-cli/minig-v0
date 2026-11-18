@@ -1,5 +1,7 @@
 # Technical Architecture & Stages Implementation Guide
 
+> Current package map, run loop, and contribution rules: [`docs/technical.md`](./docs/technical.md). This file is the earlier stage-by-stage narrative. Where the two differ, follow `docs/technical.md` and the code.
+
 > This document details the internal technical structure of **minig**, the step-by-step implementation of its execution stages, and exhaustive developer guides for extending the engine with custom agentic behaviors, built-in Go tools, MCP (Model Context Protocol) servers, and LLM providers.
 
 ---

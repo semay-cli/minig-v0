@@ -372,6 +372,8 @@ Evaluated on an **NVIDIA RTX 4060 (8 GB VRAM)** with `Qwen2.5-Coder-7B-Instruct-
 
 ## Documentation
 
+- [`docs/agent-guide.md`](./docs/agent-guide.md): How to run minig as an agent — terminal, IDE, headless HTTP, triage, and MCP.
+- [`docs/technical.md`](./docs/technical.md): Code structure, run loop, and how to read, change, and maintain the repository.
 - [`docs/ide-setup.md`](./docs/ide-setup.md): Zed, IntelliJ IDEA, VS Code, and Python service setup.
 - [`AGENT.md`](./AGENT.md): Full agent specification, prompt architectures, and safety contracts.
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md): Deep dive into stage implementation and instructions for adding custom capabilities (agentic workflows, built-in tools, MCP servers, and LLM backends).
